@@ -204,6 +204,10 @@ def should_skip_instruction_text(text: str) -> bool:
     prefixes = (
         "<permissions instructions>",
         "<collaboration_mode>",
+        "<environment_context>",
+        "<skills_instructions>",
+        "<apps_instructions>",
+        "<plugins_instructions>",
         "# AGENTS.md instructions",
     )
     return stripped.startswith(prefixes)
@@ -274,14 +278,25 @@ def extract_from_jsonl_records(records: list[Any]) -> list[dict[str, str]]:
                 messages.append({"kind": "thinking", "label": "Thinking", "text": text})
             continue
 
+        if top_type == "response_item" and payload_type == "reasoning":
+            text = flatten_text(payload.get("summary")).strip()
+            if text:
+                messages.append({"kind": "thinking", "label": "Thinking", "text": text})
+            continue
+
         if top_type == "response_item" and payload_type == "message":
             role = str(payload.get("role", "")).lower()
             phase = str(payload.get("phase", "")).lower()
             text = flatten_text(payload.get("content")).strip()
             if not text or should_skip_instruction_text(text):
                 continue
+            if role == "user":
+                messages.append({"kind": "user", "label": "User", "text": text})
+                continue
             if role == "assistant" and phase == "final_answer":
                 messages.append({"kind": "assistant", "label": "Codex", "text": text})
+            elif role == "assistant" and phase == "commentary":
+                messages.append({"kind": "thinking", "label": "Thinking", "text": text})
             continue
 
         if top_type == "response_item" and payload_type == "function_call":
