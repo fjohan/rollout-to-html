@@ -34,6 +34,18 @@ TEXT_KEYS = (
 )
 
 
+ITEM_KIND_MAP = {
+    "UserMessage": ("user", "User"),
+    "AgentMessage": ("assistant", "Codex"),
+    "Reasoning": ("thinking", "Thinking"),
+    "CommandExecution": ("code", "Code Output (command)"),
+    "FileChange": ("code", "Code Output (file change)"),
+    "Extension": ("code", "Code Output (extension)"),
+    "ImageView": ("code", "Code Output (image view)"),
+    "ContextCompaction": ("thinking", "Thinking (compaction)"),
+}
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Render a Codex rollout/session file as a transcript-style HTML page."
@@ -76,6 +88,11 @@ def parse_args() -> argparse.Namespace:
         const=Path("."),
         type=Path,
         help="Copy the matched rollout file into this directory (or the provided directory) before rendering",
+    )
+    parser.add_argument(
+        "--conversation-only",
+        action="store_true",
+        help="Render only user prompts and final Codex replies, omitting thinking and code/tool sections.",
     )
     return parser.parse_args()
 
@@ -132,7 +149,7 @@ def load_input(path: Path) -> Any:
 
     records: list[Any] = []
     jsonl_ok = True
-    for line in raw.splitlines():
+    for line in raw.split("\n"):
         if not line.strip():
             continue
         try:
@@ -152,6 +169,13 @@ def parse_json_maybe(text: str) -> Any:
         return json.loads(text)
     except Exception:
         return None
+
+
+def strip_file_uri(value: Any) -> str:
+    text = flatten_text(value).strip()
+    if text.startswith("file://"):
+        return text.removeprefix("file://")
+    return text
 
 
 def iter_message_candidates(obj: Any) -> list[dict[str, Any]]:
@@ -197,11 +221,25 @@ def flatten_text(value: Any) -> str:
     return str(value)
 
 
+def compact_messages(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    compacted: list[dict[str, str]] = []
+    for entry in messages:
+        if compacted and compacted[-1]["kind"] == entry["kind"] and compacted[-1]["text"] == entry["text"]:
+            continue
+        if compacted and compacted[-1]["kind"] == entry["kind"] and compacted[-1]["label"] == entry["label"]:
+            compacted[-1]["text"] += "\n\n" + entry["text"]
+        else:
+            compacted.append(entry)
+    return compacted
+
+
 def should_skip_instruction_text(text: str) -> bool:
     stripped = text.strip()
     if not stripped:
         return True
     prefixes = (
+        "<system>",
+        "<developer>",
         "<permissions instructions>",
         "<collaboration_mode>",
         "<environment_context>",
@@ -223,6 +261,192 @@ def format_tool_call(name: str, arguments: str) -> str:
         if interesting:
             return f"{name}\n" + "\n".join(interesting)
     return f"{name}\n{arguments}".strip()
+
+
+def format_command_execution(item: dict[str, Any]) -> str:
+    parts: list[str] = []
+    command = item.get("command")
+    if isinstance(command, list):
+        command = " ".join(str(part) for part in command)
+    command_text = flatten_text(command).strip()
+    if command_text:
+        parts.append(f"$ {command_text}")
+
+    cwd = strip_file_uri(item.get("cwd"))
+    if cwd:
+        parts.append(f"cwd: {cwd}")
+
+    status = flatten_text(item.get("status")).strip()
+    exit_code = item.get("exit_code")
+    if status or exit_code is not None:
+        status_line = f"status: {status}" if status else "status:"
+        if exit_code is not None:
+            status_line += f" (exit {exit_code})"
+        parts.append(status_line)
+
+    formatted = flatten_text(item.get("formatted_output")).strip()
+    stdout = flatten_text(item.get("stdout")).strip()
+    stderr = flatten_text(item.get("stderr")).strip()
+    aggregated = flatten_text(item.get("aggregated_output")).strip()
+    if formatted:
+        parts.append(formatted)
+    else:
+        if stdout:
+            parts.append(stdout)
+        if stderr:
+            parts.append(stderr)
+        elif aggregated and aggregated != stdout:
+            parts.append(aggregated)
+
+    return "\n".join(part for part in parts if part.strip())
+
+
+def format_file_change(item: dict[str, Any]) -> str:
+    changes = item.get("changes")
+    if isinstance(changes, dict):
+        lines: list[str] = []
+        for path, change in changes.items():
+            change_type = ""
+            if isinstance(change, dict):
+                change_type = flatten_text(change.get("type")).strip()
+            suffix = f" ({change_type})" if change_type else ""
+            lines.append(f"{path}{suffix}")
+        if lines:
+            return "\n".join(lines)
+    return flatten_text(item).strip()
+
+
+def format_action(action: Any) -> str:
+    if not isinstance(action, dict):
+        return flatten_text(action).strip()
+
+    action_type = flatten_text(action.get("type")).strip()
+    query = flatten_text(action.get("query")).strip()
+    queries = action.get("queries")
+    lines = []
+    if action_type:
+        lines.append(f"action: {action_type}")
+    if query:
+        lines.append(f"query: {query}")
+    if isinstance(queries, list):
+        lines.extend(f"- {flatten_text(item).strip()}" for item in queries if flatten_text(item).strip())
+    return "\n".join(lines)
+
+
+def format_extension(item: dict[str, Any]) -> str:
+    kind = flatten_text(item.get("kind")).strip()
+    query = flatten_text(item.get("query")).strip()
+    action = item.get("action")
+    results = item.get("results")
+    parts = [part for part in (kind, query) if part]
+    action_text = format_action(action)
+    if action_text:
+        parts.append(action_text)
+    if isinstance(results, list):
+        for result in results[:10]:
+            if not isinstance(result, dict):
+                continue
+            title = flatten_text(result.get("title")).strip()
+            url = flatten_text(result.get("url")).strip()
+            snippet = flatten_text(result.get("snippet")).strip()
+            line = title or url or snippet
+            if url and title:
+                line = f"{title}\n{url}"
+            if snippet:
+                line = f"{line}\n{snippet}" if line else snippet
+            if line:
+                parts.append(line)
+    return "\n\n".join(parts) or flatten_text(item).strip()
+
+
+def format_mcp_tool_call_end(payload: dict[str, Any]) -> str:
+    invocation = payload.get("invocation")
+    parts: list[str] = []
+    if isinstance(invocation, dict):
+        server = flatten_text(invocation.get("server")).strip()
+        tool = flatten_text(invocation.get("tool")).strip()
+        name = ".".join(part for part in (server, tool) if part)
+        if name:
+            parts.append(name)
+        arguments = flatten_text(invocation.get("arguments")).strip()
+        if arguments and arguments != "{}":
+            parts.append(arguments)
+
+    result = payload.get("result")
+    result_text = flatten_text(result).strip()
+    if result_text:
+        parts.append(result_text)
+    return "\n\n".join(parts) or flatten_text(payload).strip()
+
+
+def normalize_event_payload(payload: dict[str, Any]) -> dict[str, str] | None:
+    payload_type = str(payload.get("type", ""))
+    if payload_type == "patch_apply_end":
+        text = format_file_change(payload)
+        stdout = flatten_text(payload.get("stdout")).strip()
+        stderr = flatten_text(payload.get("stderr")).strip()
+        extra = "\n".join(part for part in (stdout, stderr) if part)
+        if extra:
+            text = f"{text}\n\n{extra}" if text else extra
+        return {"kind": "code", "label": "Code Output (patch)", "text": text} if text else None
+
+    if payload_type == "web_search_end":
+        text = format_extension(payload)
+        return {"kind": "code", "label": "Code Output (web search)", "text": text} if text else None
+
+    if payload_type == "mcp_tool_call_end":
+        text = format_mcp_tool_call_end(payload)
+        return {"kind": "code", "label": "Code Output (MCP tool)", "text": text} if text else None
+
+    if payload_type in {"context_compacted", "turn_aborted"}:
+        text = flatten_text(payload).strip()
+        return {"kind": "thinking", "label": f"Thinking ({payload_type})", "text": text} if text else None
+
+    return None
+
+
+def normalize_completed_item(item: dict[str, Any]) -> dict[str, str] | None:
+    item_type = str(item.get("type", ""))
+    mapped = ITEM_KIND_MAP.get(item_type)
+    if not mapped:
+        return None
+
+    kind, label = mapped
+    if item_type == "AgentMessage":
+        phase = str(item.get("phase", "")).lower()
+        if phase == "commentary":
+            kind = "thinking"
+            label = "Thinking (commentary)"
+        elif phase and phase != "final_answer":
+            kind = "thinking"
+            label = f"Thinking ({phase})"
+    elif item_type == "CommandExecution":
+        text = format_command_execution(item)
+        return {"kind": kind, "label": label, "text": text} if text else None
+    elif item_type == "FileChange":
+        text = format_file_change(item)
+        return {"kind": kind, "label": label, "text": text} if text else None
+    elif item_type == "Extension":
+        text = format_extension(item)
+        extension_kind = flatten_text(item.get("kind")).strip()
+        if extension_kind:
+            label = f"Code Output ({extension_kind})"
+        return {"kind": kind, "label": label, "text": text} if text else None
+    elif item_type == "ImageView":
+        path = strip_file_uri(item.get("path"))
+        text = f"Viewed image: {path}" if path else flatten_text(item).strip()
+        return {"kind": kind, "label": label, "text": text} if text else None
+
+    text = (
+        flatten_text(item.get("content"))
+        or flatten_text(item.get("summary_text"))
+        or flatten_text(item.get("raw_content"))
+        or flatten_text(item.get("message"))
+        or flatten_text(item.get("last_agent_message"))
+    ).strip()
+    if not text or should_skip_instruction_text(text):
+        return None
+    return {"kind": kind, "label": label, "text": text}
 
 
 def looks_like_final_assistant_message(text: str) -> bool:
@@ -255,6 +479,20 @@ def extract_from_jsonl_records(records: list[Any]) -> list[dict[str, str]]:
             continue
 
         payload_type = payload.get("type")
+
+        if top_type == "event_msg" and payload_type == "item_completed":
+            item = payload.get("item")
+            if isinstance(item, dict):
+                entry = normalize_completed_item(item)
+                if entry:
+                    messages.append(entry)
+            continue
+
+        if top_type == "event_msg":
+            entry = normalize_event_payload(payload)
+            if entry:
+                messages.append(entry)
+                continue
 
         if top_type == "event_msg" and payload_type == "user_message":
             text = flatten_text(payload.get("message")).strip()
@@ -330,15 +568,13 @@ def extract_from_jsonl_records(records: list[Any]) -> list[dict[str, str]]:
                 messages.append({"kind": "code", "label": "Code Output", "text": output})
             continue
 
-    compacted: list[dict[str, str]] = []
-    for entry in messages:
-        if compacted and compacted[-1]["kind"] == entry["kind"] and compacted[-1]["text"] == entry["text"]:
+        if top_type == "response_item" and payload_type == "web_search_call":
+            text = format_action(payload.get("action"))
+            if text:
+                messages.append({"kind": "code", "label": "Code Output (web search)", "text": text})
             continue
-        if compacted and compacted[-1]["kind"] == entry["kind"] and compacted[-1]["label"] == entry["label"]:
-            compacted[-1]["text"] += "\n\n" + entry["text"]
-        else:
-            compacted.append(entry)
-    return compacted
+
+    return compact_messages(messages)
 
 
 def classify_message(item: dict[str, Any]) -> str | None:
@@ -359,7 +595,7 @@ def classify_message(item: dict[str, Any]) -> str | None:
         if channel in {"analysis", "commentary", "summary"}:
             return "thinking"
 
-    if msg_type in {"tool_result", "tool_call", "function_call", "function_result", "command"}:
+    if msg_type in {"tool_result", "tool_call", "function_call", "function_result", "command", "web_search_call"}:
         return "code"
     if msg_type in {"reasoning", "analysis", "thought", "commentary"}:
         return "thinking"
@@ -441,13 +677,11 @@ def normalize_messages(data: Any) -> list[dict[str, str]]:
             }
         )
 
-    compacted: list[dict[str, str]] = []
-    for entry in normalized:
-        if compacted and compacted[-1]["kind"] == entry["kind"] and compacted[-1]["label"] == entry["label"]:
-            compacted[-1]["text"] += "\n\n" + entry["text"]
-        else:
-            compacted.append(entry)
-    return compacted
+    return compact_messages(normalized)
+
+
+def conversation_only(messages: list[dict[str, str]]) -> list[dict[str, str]]:
+    return [message for message in messages if message["kind"] in {"user", "assistant"}]
 
 
 def render_message(entry: dict[str, str]) -> str:
@@ -686,6 +920,8 @@ def main() -> int:
 
     data = load_input(source)
     messages = normalize_messages(data)
+    if args.conversation_only:
+        messages = conversation_only(messages)
     rendered = build_html(title, messages)
 
     output.write_text(rendered, encoding="utf-8")
