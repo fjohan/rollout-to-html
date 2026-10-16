@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import html
 import json
+import re
 import shutil
 from pathlib import Path
 from typing import Any
@@ -44,6 +45,14 @@ ITEM_KIND_MAP = {
     "ImageView": ("code", "Code Output (image view)"),
     "ContextCompaction": ("thinking", "Thinking (compaction)"),
 }
+
+
+# Match image data URLs in plain text as well as JSON embedded in tool output.
+# Restrict the payload to base64 characters so quotes and surrounding prose survive.
+IMAGE_DATA_URL = re.compile(
+    r"data:image/[a-z0-9.+-]+(?:;[a-z0-9.+_-]+=[a-z0-9.+_-]+)*;base64,[a-z0-9+/=_-]+",
+    re.IGNORECASE,
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -90,9 +99,16 @@ def parse_args() -> argparse.Namespace:
         help="Copy the matched rollout file into this directory (or the provided directory) before rendering",
     )
     parser.add_argument(
+        "-c",
         "--conversation-only",
         action="store_true",
         help="Render only user prompts and final Codex replies, omitting thinking and code/tool sections.",
+    )
+    parser.add_argument(
+        "-e",
+        "--exclude-image-data",
+        action="store_true",
+        help="Replace base64 image data URLs with [image data] in the rendered transcript.",
     )
     return parser.parse_args()
 
@@ -469,7 +485,21 @@ def looks_like_final_assistant_message(text: str) -> bool:
 def extract_from_jsonl_records(records: list[Any]) -> list[dict[str, str]]:
     messages: list[dict[str, str]] = []
 
-    for record in records:
+    def user_text(content: Any) -> str:
+        if not isinstance(content, list):
+            return ""
+        parts = []
+        for part in content:
+            if not isinstance(part, dict) or part.get("type") not in {"text", "input_text"}:
+                continue
+            text = flatten_text(part.get("text")).strip()
+            if text.startswith("<image ") or text == "</image>":
+                continue
+            if text:
+                parts.append(text)
+        return "\n".join(parts)
+
+    for index, record in enumerate(records):
         if not isinstance(record, dict):
             continue
 
@@ -483,6 +513,20 @@ def extract_from_jsonl_records(records: list[Any]) -> list[dict[str, str]]:
         if top_type == "event_msg" and payload_type == "item_completed":
             item = payload.get("item")
             if isinstance(item, dict):
+                # Image prompts have two adjacent representations whose image
+                # fields differ, so compact_messages cannot compare them directly.
+                previous = records[index - 1] if index else None
+                if item.get("type") == "UserMessage" and isinstance(previous, dict):
+                    prior = previous.get("payload")
+                    if (
+                        previous.get("type") == "response_item"
+                        and isinstance(prior, dict)
+                        and prior.get("type") == "message"
+                        and prior.get("role") == "user"
+                        and user_text(item.get("content"))
+                        and user_text(item.get("content")) == user_text(prior.get("content"))
+                    ):
+                        continue
                 entry = normalize_completed_item(item)
                 if entry:
                     messages.append(entry)
@@ -684,10 +728,13 @@ def conversation_only(messages: list[dict[str, str]]) -> list[dict[str, str]]:
     return [message for message in messages if message["kind"] in {"user", "assistant"}]
 
 
-def render_message(entry: dict[str, str]) -> str:
+def render_message(entry: dict[str, str], exclude_image_data: bool = False) -> str:
     kind = entry["kind"]
     label = html.escape(entry["label"])
-    body = html.escape(entry["text"])
+    text = entry["text"]
+    if exclude_image_data:
+        text = IMAGE_DATA_URL.sub("[image data]", text)
+    body = html.escape(text)
     collapsible = kind in {"thinking", "code"}
 
     if collapsible:
@@ -706,8 +753,10 @@ def render_message(entry: dict[str, str]) -> str:
     """.strip()
 
 
-def build_html(title: str, messages: list[dict[str, str]]) -> str:
-    body = "\n".join(render_message(message) for message in messages)
+def build_html(
+    title: str, messages: list[dict[str, str]], exclude_image_data: bool = False
+) -> str:
+    body = "\n".join(render_message(message, exclude_image_data) for message in messages)
     return f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -922,7 +971,7 @@ def main() -> int:
     messages = normalize_messages(data)
     if args.conversation_only:
         messages = conversation_only(messages)
-    rendered = build_html(title, messages)
+    rendered = build_html(title, messages, exclude_image_data=args.exclude_image_data)
 
     output.write_text(rendered, encoding="utf-8")
     print(f"Wrote {output}")
